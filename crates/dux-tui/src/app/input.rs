@@ -9826,6 +9826,26 @@ impl App {
     }
 
     fn handle_left_mouse_wheel(&mut self, down: bool, column: u16, row: u16) {
+        // The expanded list scrolls like any list: one item per tick, the
+        // selection left where it is. The wheel focuses the pane under the
+        // pointer, as it does everywhere else.
+        if !self.left_collapsed {
+            self.focus = FocusPane::Left;
+            self.input_target = InputTarget::None;
+            self.fullscreen_overlay = FullscreenOverlay::None;
+            let last = self.left_items().len().saturating_sub(1);
+            self.left_list_offset = if down {
+                self.left_list_offset.saturating_add(1).min(last)
+            } else {
+                self.left_list_offset.saturating_sub(1)
+            };
+            // The user is looking around: the list stays where the wheel put
+            // it until the selection moves.
+            self.left_list_follows_selection = false;
+            return;
+        }
+        // The icon rail is one row per agent with no scroll position of its
+        // own, so there the wheel still walks the selection.
         let target_index = match self.mouse_target(column, row) {
             Some(MouseTarget::LeftRow(index)) => index,
             _ => self.selected_left,
@@ -20219,9 +20239,8 @@ not_a_real_action = ["x"]
     }
 
     /// Fork aaa59319: with more agents than the left pane can show, the wheel
-    /// over the pane (here its title border, not a row) walks the selection and
-    /// the rendered list follows it, so rows below the fold become reachable.
-    /// Drives the real renderer, which owns the list offset upstream.
+    /// over the pane (here its title border, not a row) scrolls the list, so
+    /// rows below the fold become reachable. Drives the real renderer.
     #[test]
     fn mouse_wheel_left_pane_scrolls_overflowing_agent_list() {
         let mut app = test_app(default_bindings());
@@ -20240,6 +20259,7 @@ not_a_real_action = ["x"]
         let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 20)).expect("terminal");
         draw_frame(&mut app, &mut terminal);
         let first_row = app.mouse_layout.left_row_to_item.first().copied();
+        let selected = app.selected_left;
         let left = app.mouse_layout.left;
 
         for _ in 0..30 {
@@ -20249,20 +20269,181 @@ not_a_real_action = ["x"]
 
         assert_eq!(app.focus, FocusPane::Left);
         let map = &app.mouse_layout.left_row_to_item;
-        assert!(
-            map.contains(&app.selected_left),
-            "the selected row {} must be on screen after wheeling: {map:?}",
-            app.selected_left
-        );
-        assert_ne!(
+        assert_eq!(
             map.first().copied(),
-            first_row,
-            "the list must have scrolled past its first screenful"
+            first_row.map(|row| row + 30),
+            "thirty ticks scroll the list thirty agents down: {map:?}"
+        );
+        assert_eq!(app.selected_left, selected, "and select nothing on the way");
+    }
+
+    /// The wheel scrolls the agent list like any list: one item per tick, in
+    /// the direction of the wheel, wherever in the pane the pointer is. It does
+    /// not change which agent is selected, so the agent pane keeps showing what
+    /// the user was looking at.
+    ///
+    /// The list used to have no scroll position of its own. Every frame it was
+    /// placed from the top so the selected row came out at the bottom edge, and
+    /// the wheel selected the row under the pointer plus one. Over a row in the
+    /// middle of a scrolled list that moved the selection UP the screen, the
+    /// list re-anchored to it, and a wheel down threw the list backwards.
+    #[test]
+    fn the_wheel_scrolls_the_agent_list_and_leaves_the_selection_alone() {
+        let mut app = test_app(default_bindings());
+        let now = Utc::now();
+        app.engine.sessions.clear();
+        for i in 0..40 {
+            let id = format!("s{i:02}");
+            app.engine.sessions.push(filter_test_session(
+                &id,
+                &format!("agent-{i:02}"),
+                "project-1",
+                now,
+            ));
+        }
+        app.rebuild_left_items();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+        draw_frame(&mut app, &mut terminal);
+        let selected = app.selected_session().map(|s| s.id.clone());
+        let first = |app: &App| app.mouse_layout.left_row_to_item.first().copied();
+        let start = first(&app).expect("a first row");
+        // A row in the middle of the list, not the pane's border.
+        let list = app.mouse_layout.left_list;
+        let (x, y) = (list.x + 2, list.y + list.height / 2);
+
+        let mut tops = vec![start];
+        for _ in 0..6 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y));
+            draw_frame(&mut app, &mut terminal);
+            tops.push(first(&app).expect("a first row"));
+        }
+        assert_eq!(
+            tops,
+            (start..=start + 6).collect::<Vec<_>>(),
+            "each tick down moves the list one item further"
+        );
+        for _ in 0..6 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y));
+            draw_frame(&mut app, &mut terminal);
+        }
+        assert_eq!(
+            first(&app),
+            Some(start),
+            "and the same ticks up bring it back"
+        );
+        assert_eq!(
+            app.selected_session().map(|s| s.id.clone()),
+            selected,
+            "scrolling is not selecting"
         );
     }
 
+    /// The list stops at its last row: wheeling past the end leaves the last
+    /// agent on screen instead of scrolling the list off into empty space.
     #[test]
-    fn mouse_wheel_left_pane_advances_selection_under_cursor() {
+    fn the_wheel_stops_at_the_end_of_the_agent_list() {
+        let mut app = test_app(default_bindings());
+        let now = Utc::now();
+        app.engine.sessions.clear();
+        for i in 0..40 {
+            let id = format!("s{i:02}");
+            app.engine.sessions.push(filter_test_session(
+                &id,
+                &format!("agent-{i:02}"),
+                "project-1",
+                now,
+            ));
+        }
+        app.rebuild_left_items();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+        draw_frame(&mut app, &mut terminal);
+        let left = app.mouse_layout.left;
+        let last = app.left_items().len() - 1;
+
+        for _ in 0..100 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollDown, left.x + 2, left.y));
+            draw_frame(&mut app, &mut terminal);
+        }
+
+        let map = &app.mouse_layout.left_row_to_item;
+        assert_eq!(
+            map.last().copied(),
+            Some(last),
+            "the last agent is on screen"
+        );
+        assert!(
+            map.len() + 3 > usize::from(app.mouse_layout.left_list.height),
+            "and the list still fills the pane: {map:?}"
+        );
+    }
+
+    /// Moving the selection with the keyboard brings it into view, moving the
+    /// list only as far as that takes, and a list the wheel scrolled away from
+    /// the selection comes back to it on the next move.
+    #[test]
+    fn keyboard_moves_scroll_the_agent_list_only_as_far_as_needed() {
+        let mut app = test_app(default_bindings());
+        let now = Utc::now();
+        app.engine.sessions.clear();
+        for i in 0..40 {
+            let id = format!("s{i:02}");
+            app.engine.sessions.push(filter_test_session(
+                &id,
+                &format!("agent-{i:02}"),
+                "project-1",
+                now,
+            ));
+        }
+        app.rebuild_left_items();
+        app.focus = FocusPane::Left;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+        draw_frame(&mut app, &mut terminal);
+        let first = |app: &App| app.mouse_layout.left_row_to_item.first().copied();
+        let on_screen = |app: &App| {
+            app.mouse_layout
+                .left_row_to_item
+                .contains(&app.selected_left)
+        };
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+
+        // Walk down past the fold: the selection stays on screen throughout.
+        for _ in 0..12 {
+            app.handle_key(down).unwrap();
+            draw_frame(&mut app, &mut terminal);
+            assert!(on_screen(&app), "row {} left the screen", app.selected_left);
+        }
+        let scrolled = first(&app);
+        assert_ne!(scrolled, Some(0), "the list followed the selection down");
+
+        // One step back up stays inside what is already on screen, so the list
+        // does not move at all.
+        app.handle_key(up).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        assert_eq!(
+            first(&app),
+            scrolled,
+            "a move inside the view scrolls nothing"
+        );
+
+        // The wheel takes the list away from the selection...
+        let left = app.mouse_layout.left;
+        for _ in 0..100 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollDown, left.x + 2, left.y));
+        }
+        draw_frame(&mut app, &mut terminal);
+        assert!(!on_screen(&app), "the wheel scrolled past the selection");
+        // ...and the next move brings the list back to it.
+        app.handle_key(down).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        assert!(on_screen(&app), "a move returns the view to the selection");
+    }
+
+    /// Over a row, the wheel focuses the pane and scrolls the list. The row
+    /// under the pointer is not selected: scrolling past an agent is not
+    /// choosing it.
+    #[test]
+    fn mouse_wheel_over_an_agent_row_scrolls_without_selecting_it() {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
         app.focus = FocusPane::Center;
@@ -20271,7 +20452,11 @@ not_a_real_action = ["x"]
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 2, 1));
 
         assert_eq!(app.focus, FocusPane::Left);
-        assert_eq!(app.selected_left, 1);
+        assert_eq!(app.selected_left, 0);
+        assert!(
+            !app.left_list_follows_selection,
+            "the list is the wheel's until the selection moves"
+        );
     }
 
     /// Spawn a real child that prints enough lines to build alacritty history,
@@ -31734,10 +31919,13 @@ cyan = "#00ffff"
         );
     }
 
+    /// The collapsed icon rail is one row per agent with no scroll position
+    /// of its own, so the wheel walks the selection there and the rail follows.
     #[test]
-    fn mouse_wheel_on_left_pane_chrome_moves_selection() {
+    fn mouse_wheel_on_the_collapsed_rail_moves_the_selection() {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
+        app.left_collapsed = true;
         app.focus = FocusPane::Center;
         app.selected_left = 0;
         // Row 0 is the left pane's top border: inside `left`, outside
@@ -31748,6 +31936,22 @@ cyan = "#00ffff"
 
         assert_eq!(app.focus, FocusPane::Left);
         assert_eq!(app.selected_left, 1);
+    }
+
+    /// The pane's border and title scroll the expanded list too, and select
+    /// nothing, exactly like a tick over a row.
+    #[test]
+    fn mouse_wheel_on_left_pane_chrome_scrolls_without_selecting() {
+        let mut app = test_app(default_bindings());
+        install_mouse_layout(&mut app);
+        app.focus = FocusPane::Center;
+        app.selected_left = 0;
+        assert_eq!(app.mouse_target(2, 0), Some(MouseTarget::LeftPane));
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 2, 0));
+
+        assert_eq!(app.focus, FocusPane::Left);
+        assert_eq!(app.selected_left, 0);
     }
 
     // ── Click-outside-fullscreen tests ──────────────────────────────

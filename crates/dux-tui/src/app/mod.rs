@@ -476,6 +476,19 @@ pub struct App {
     /// `dismissedQuery`.
     pub(crate) inactive_search_dismissed: Option<String>,
     pub(crate) left_items_cache: Vec<LeftItem>,
+    /// Where the expanded agent list is scrolled to: the index of the first
+    /// item it shows. Kept between frames, so the list moves only when the
+    /// wheel scrolls it or the selection has to be brought into view, never
+    /// because a frame was drawn. The renderer clamps it to the list it has.
+    pub(crate) left_list_offset: usize,
+    /// Whether the agent list keeps the selection in view. True until the wheel
+    /// scrolls the list, which may take the selection off screen on purpose,
+    /// and true again as soon as the selection moves to another row.
+    pub(crate) left_list_follows_selection: bool,
+    /// The selection the list last followed, as an identity rather than an
+    /// index: a re-sort moves the selected agent to another index without the
+    /// user having selected anything.
+    pub(crate) left_list_followed: Option<String>,
     pub(crate) mouse_layout: MouseLayoutState,
     pub(crate) overlay_layout: OverlayMouseLayoutState,
     pub(crate) mouse_drag: Option<ResizeDragState>,
@@ -4118,6 +4131,9 @@ impl App {
             inactive_search_dismissed: None,
             inactive_collapse_overridden: false,
             left_items_cache: Vec::new(),
+            left_list_offset: 0,
+            left_list_follows_selection: true,
+            left_list_followed: None,
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),
             mouse_drag: None,
@@ -6034,6 +6050,17 @@ impl App {
         {
             Some(tail) => index < tail,
             None => true,
+        }
+    }
+
+    /// What the agent-list selection points at, as an identity that survives a
+    /// re-sort: the selected agent's id, or a fixed name for the Inactive
+    /// toggle. `None` when nothing is selected.
+    pub(crate) fn left_selection_identity(&self) -> Option<String> {
+        match self.left_items().get(self.selected_left)? {
+            LeftItem::Session(index) => self.engine.sessions.get(*index).map(|s| s.id.clone()),
+            LeftItem::InactiveToggle => Some("\u{0}inactive-toggle".to_string()),
+            LeftItem::ProjectHeader(_) => None,
         }
     }
 

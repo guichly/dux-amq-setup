@@ -359,6 +359,63 @@ pub(crate) fn left_row_to_item(offset: usize, heights: &[u16], area_height: u16)
     map
 }
 
+/// The furthest the agent list may be scrolled: the smallest offset from which
+/// every remaining item still fits in `area_height` rows. Scrolling further
+/// would only trade rows of agents for empty space at the bottom. Zero when the
+/// whole list fits.
+pub(crate) fn max_list_offset(heights: &[u16], area_height: u16) -> usize {
+    let mut used = 0u16;
+    let mut offset = heights.len();
+    while offset > 0 {
+        let height = heights[offset - 1].max(1);
+        if used.saturating_add(height) > area_height {
+            break;
+        }
+        used += height;
+        offset -= 1;
+    }
+    // A pane too short for even the last item still shows that item.
+    offset.min(heights.len().saturating_sub(1))
+}
+
+/// The offset that puts item `selected` fully on screen, moving the list as
+/// little as possible from `offset`: not at all when the item is already in
+/// view, up to it when it is above, and down just far enough when it is below.
+///
+/// `is_header(i)` marks the rows that are labels for the rows under them. When
+/// the item ends up at the top of the view its header comes with it, because a
+/// first agent shown without the header above it reads as belonging to the
+/// group before.
+pub(crate) fn list_offset_showing(
+    selected: usize,
+    offset: usize,
+    heights: &[u16],
+    area_height: u16,
+    is_header: impl Fn(usize) -> bool,
+) -> usize {
+    let Some(last) = heights.len().checked_sub(1) else {
+        return 0;
+    };
+    let selected = selected.min(last);
+    let rows = |from: usize, to: usize| -> u32 {
+        heights[from..=to]
+            .iter()
+            .map(|height| u32::from((*height).max(1)))
+            .sum()
+    };
+    if selected <= offset {
+        let with_header = selected > 0
+            && is_header(selected - 1)
+            && rows(selected - 1, selected) <= u32::from(area_height);
+        return if with_header { selected - 1 } else { selected };
+    }
+    let mut offset = offset;
+    while offset < selected && rows(offset, selected) > u32::from(area_height) {
+        offset += 1;
+    }
+    offset
+}
+
 /// Split `label` into up to three spans around a matched CHAR range
 /// (`dux_core::agent_search::match_char_range` semantics: start inclusive, end
 /// exclusive, char indices): the text before the hit in `base`, the hit in
@@ -2540,12 +2597,36 @@ impl App {
             )
             .render(search_area, frame.buffer_mut());
         }
-        let mut state =
-            ListState::default().with_selected(if self.left_section == LeftSection::Projects {
-                Some(self.selected_left)
-            } else {
-                None
-            });
+        // The list is scrolled to where it was left, not re-placed from the
+        // top every frame. It follows the selection while that is what the user
+        // is driving: a selection that moved to another row is brought into
+        // view by the smallest move that shows it. The wheel scrolls the list
+        // on its own and may leave the selection off screen until it moves.
+        let selection = self.left_selection_identity();
+        if selection != self.left_list_followed {
+            self.left_list_followed = selection;
+            self.left_list_follows_selection = true;
+        }
+        let headers: Vec<bool> = self
+            .left_items()
+            .iter()
+            .map(|item| matches!(item, LeftItem::ProjectHeader(_)))
+            .collect();
+        let list_height = geometry.body.height;
+        let mut offset = self.left_list_offset;
+        if self.left_list_follows_selection && self.left_section == LeftSection::Projects {
+            offset = list_offset_showing(
+                self.selected_left,
+                offset,
+                &item_heights,
+                list_height,
+                |index| headers[index],
+            );
+        }
+        let offset = offset.min(max_list_offset(&item_heights, list_height));
+        // No selection is handed to the widget: it would scroll the list to
+        // keep that row in view, which is the decision made just above.
+        let mut state = ListState::default().with_offset(offset);
         // No widget highlight: the selection is painted by hand below (an accent
         // bar plus a faint tint) so it keeps each row's text colors and leaves the
         // Inactive separator row untouched, neither of which a whole-cell List
@@ -2559,6 +2640,7 @@ impl App {
         // Agent rows are three lines tall, so a click row does not map 1:1 to a
         // list item: rebuild the reverse map from the post-render scroll offset
         // and each item's rendered height.
+        self.left_list_offset = state.offset();
         self.mouse_layout.left_row_to_item =
             left_row_to_item(state.offset(), &item_heights, geometry.content.height);
         // When an overlay is about to grayscale the body (a modal, the help page,
@@ -16111,6 +16193,51 @@ mod tests {
         assert_eq!(app.snapshot_buf.scrollback_total, 0);
         let _ = draw_caret_frame(&mut app);
         assert!(app.mouse_layout.agent_scrollbar.is_none());
+    }
+
+    #[test]
+    fn max_list_offset_stops_where_the_rest_of_the_list_still_fits() {
+        // Five three-row agents in a ten-row pane: three fit, so the list may
+        // scroll until the last three are showing.
+        assert_eq!(max_list_offset(&[3, 3, 3, 3, 3], 10), 2);
+        // Everything fits: nothing to scroll.
+        assert_eq!(max_list_offset(&[3, 3, 3], 10), 0);
+        assert_eq!(max_list_offset(&[], 10), 0);
+        // A two-row header counts for what it takes.
+        assert_eq!(max_list_offset(&[2, 3, 2, 3, 3], 8), 2);
+        // A pane too short for one agent still shows the last one.
+        assert_eq!(max_list_offset(&[3, 3, 3], 2), 2);
+    }
+
+    #[test]
+    fn list_offset_showing_moves_the_list_as_little_as_it_can() {
+        let heights = [3u16; 10];
+        let no_headers = |_: usize| false;
+        // Already in view: the list stays put.
+        assert_eq!(list_offset_showing(3, 2, &heights, 9, no_headers), 2);
+        assert_eq!(list_offset_showing(4, 2, &heights, 9, no_headers), 2);
+        // One row below the view: one step down, the item lands at the bottom.
+        assert_eq!(list_offset_showing(5, 2, &heights, 9, no_headers), 3);
+        // Above the view: up to the item, which lands at the top.
+        assert_eq!(list_offset_showing(1, 4, &heights, 9, no_headers), 1);
+        // Out of range is the last item; an empty list has no offset.
+        assert_eq!(list_offset_showing(99, 0, &heights, 9, no_headers), 7);
+        assert_eq!(list_offset_showing(0, 3, &[], 9, no_headers), 0);
+    }
+
+    #[test]
+    fn list_offset_showing_brings_the_header_of_a_group_with_its_first_agent() {
+        // header, agent, agent, header, agent, agent
+        let heights = [2u16, 3, 3, 2, 3, 3];
+        let is_header = |index: usize| index == 0 || index == 3;
+        // Moving up onto the first agent of the second group shows its header.
+        assert_eq!(list_offset_showing(4, 5, &heights, 9, is_header), 3);
+        // The same at the very top of the list.
+        assert_eq!(list_offset_showing(1, 2, &heights, 9, is_header), 0);
+        // A second agent of a group has no header directly above it.
+        assert_eq!(list_offset_showing(2, 4, &heights, 9, is_header), 2);
+        // Too short a pane for header and agent together: the agent wins.
+        assert_eq!(list_offset_showing(4, 5, &heights, 4, is_header), 4);
     }
 
     #[test]
